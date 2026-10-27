@@ -14,6 +14,10 @@ from time import sleep
 
 _LOGGER = logging.getLogger(__name__)
 
+# Status messages from the unit are "N" + 6 digit sequence number + JSON list.
+HEADER_PATTERN = re.compile(rb"N(\d{6})")
+STATUS_PATTERN = re.compile(rb"N(\d{6})(\[.*?\])", re.DOTALL)
+
 
 class RinnaiConnectionState(enum.Enum):
     """Possible connection states for this class."""
@@ -86,6 +90,20 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes,too-
         """Queue a command to be sent to the unit."""
         self._sendqueue.put(command)
 
+    def _discard_queued_commands(self) -> None:
+        """Empty the command queue, logging anything that is dropped."""
+        dropped = 0
+        while True:
+            try:
+                self._sendqueue.get_nowait()
+                dropped += 1
+            except Empty:
+                break
+        if dropped:
+            _LOGGER.warning(
+                "Discarded %d command(s) queued while disconnected", dropped
+            )
+
     def __del__(self):
         """Destructor to ensure the thread is stopped and the socket closed."""
         self.stop_thread()
@@ -141,7 +159,8 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes,too-
             for handler in self._connection_state_handlers:
                 try:
                     handler(self._socketstate)
-                except (ValueError, TypeError) as e:
+                except Exception as e:  # pylint: disable=broad-exception-caught
+                    # A failing handler must not take down the connection thread.
                     _LOGGER.error("Invalid socket state handler (%s)", e)
             _LOGGER.debug("Socket state is now %s", self._socketstate)
 
@@ -187,20 +206,31 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes,too-
         """Thread that polls the socket and command queue and reacts accordingly."""
         _LOGGER.debug("Starting event loop within thread")
         while not self._thread_exit_flag:
-            # Connect, then monitor. Repeat ad infinitum, unless we've been told
-            # to exit.
-            self._create_socket_and_connect()
-            # Note that this only returns on disconnect/socket error, or when the thread
-            # exit flag is set.
-            self._monitor_socket_and_queue()
+            try:
+                # Connect, then monitor. Repeat ad infinitum, unless we've been told
+                # to exit.
+                self._create_socket_and_connect()
+                # Note that this only returns on disconnect/socket error, or when the
+                # thread exit flag is set.
+                self._monitor_socket_and_queue()
+            except Exception:  # pylint: disable=broad-exception-caught
+                # Never let an unexpected error kill this thread: without it there are
+                # no status updates, no commands sent and no reconnects.
+                _LOGGER.exception("Unexpected error in connection thread, reconnecting")
+                self._update_socket_state(RinnaiConnectionState.ERROR)
+                # Short pause so a persistent error can't spin, but short enough that
+                # stop_thread's join(5) still sees us exit.
+                sleep(2)
 
     def _monitor_socket_and_queue(self) -> None:
         # Create the selector and register for read events on the socket and the send
         # queue.  Write events on the socket aren't selected for until we have something
         # to say.
-        selector = selectors.DefaultSelector()
-        selector.register(self._socket, selectors.EVENT_READ)
+        with selectors.DefaultSelector() as selector:
+            selector.register(self._socket, selectors.EVENT_READ)
+            self._monitor_loop(selector)
 
+    def _monitor_loop(self, selector: selectors.BaseSelector) -> None:
         self._readbuffer.clear()
         self._writebuffer.clear()
 
@@ -213,7 +243,7 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes,too-
                 mask |= selectors.EVENT_WRITE
                 _LOGGER.debug("Selecting for write")
 
-            selector.modify(self._socket, selectors.EVENT_READ)
+            selector.modify(self._socket, mask)
 
             events = selector.select(0.1)
             for _key, mask in events:
@@ -258,7 +288,8 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes,too-
                     # writebuffer and attempt to send it.
                     self._command_sequence = max(self._command_sequence + 1,
                                                  self._last_received_sequence_num + 1)
-                    self._command_sequence %=255
+                    # N-BW2 API: sequence numbers run 0 - 255, wrapping after 255
+                    self._command_sequence %= 256
                     sequence_header = "N" + str(self._command_sequence).zfill(6)
                     self._writebuffer.extend(sequence_header.encode())
                     self._writebuffer.extend(command.encode())
@@ -274,7 +305,7 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes,too-
                     ):
                         self._command_sequence = max(self._command_sequence + 1,
                                                       self._last_received_sequence_num + 1)
-                        self._command_sequence %=255
+                        self._command_sequence %= 256
                         sequence_header = "N" + str(self._command_sequence).zfill(6)
                         self._writebuffer.extend(sequence_header.encode())
                         self._writebuffer.extend(b"NA")
@@ -320,7 +351,6 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes,too-
 
         # Constants
         HELLO = b"*HELLO*"  # pylint: disable=invalid-name
-        START_MARKER = b"N"  # pylint: disable=invalid-name
         # At least 7 bytes are required for either the *HELLO* or NXXXXXX portions.
         # No point trying if less data than that is in the buffer.
         while len(self._readbuffer) >= 7:
@@ -335,42 +365,44 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes,too-
                         "somehow?"
                     )
                     self._readbuffer = self._readbuffer[len(HELLO) :]
-            elif self._readbuffer.startswith(START_MARKER):
-                if match := re.match(r"N(\d{6})(\[.*?\])", self._readbuffer.decode()):
+            elif HEADER_PATTERN.match(self._readbuffer):
+                # Match on the raw bytes: decoding to text first would raise on any
+                # byte that isn't valid UTF-8 and kill the connection thread.
+                if match := STATUS_PATTERN.match(self._readbuffer):
                     # First match is sequence number
                     # Second match is the JSON status to be parsed. Note that the match
                     # requires the closing bracket to be present, to ensure we have a
                     # complete status.
-                    self._last_received_sequence_num = int(match.group(1)[1:])
+                    self._last_received_sequence_num = int(match.group(1))
                     _LOGGER.debug(
                         "Received sequence number %d", self._last_received_sequence_num
                     )
+                    # Exact match rather than >=, which breaks when the sequence wraps.
                     if (self._command_wait and
-                         (self._last_received_sequence_num >= self._command_sequence)):
+                         (self._last_received_sequence_num == self._command_sequence)):
                         self._command_wait = False
                         _LOGGER.debug("Command wait end")
 
                     try:
-                        json_status = json.loads(
-                            self._readbuffer[match.start(2) : match.end(2)]
-                        )
+                        json_status = json.loads(match.group(2))
                         self._status_queue.put(json_status)
-                    except json.JSONDecodeError:
+                    except ValueError:
+                        # Covers both JSONDecodeError and UnicodeDecodeError
                         _LOGGER.error("Could not parse JSON data")
 
                     self._readbuffer = self._readbuffer[match.end() :]
                 else:
-                    # Message starting with N is incomplete (partial TCP packet).
+                    # Message starting with NXXXXXX is incomplete (partial TCP packet).
                     # Wait for more data to arrive before trying again.
                     _LOGGER.debug("Incomplete message in buffer, waiting for more data")
                     break
             # Something has already gone wrong, but maybe we can recover by looking for
             # the next marker.
-            elif match := re.match(r"N(\d{6})", self._readbuffer.decode()):
+            elif match := HEADER_PATTERN.search(self._readbuffer, 1):
                 # Cut everything before the NXXXXXX pattern.
                 _LOGGER.warning("Error parsing data, attempting recovery")
-                _LOGGER.debug("Discarded %s", self._readbuffer[: match.start(1) - 1])
-                self._readbuffer = self._readbuffer[match.start(1) :]
+                _LOGGER.debug("Discarded %s", self._readbuffer[: match.start()])
+                self._readbuffer = self._readbuffer[match.start() :]
             else:
                 _LOGGER.error(
                     "Buffer does not start with '*HELLO*' or 'N'. Something hasn't "
@@ -384,9 +416,11 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes,too-
         #time.sleep(self._connection_reconnect_delay_seconds)
         #self._update_socket_state(RinnaiConnectionState.CONNECTING)
 
-        #Try TCP directly after ~30s of no broadcast
-        MAX_UDP_FALLBACK_ATTEMPTS = 6 #pylint: disable=invalid-name
-        _udp_timeout_count = 0
+        # Try TCP directly after 30s without a broadcast from our unit. This is a time
+        # limit rather than a count of timeouts, so that other traffic on the broadcast
+        # port (or broadcasts from a different address) can't hold us here forever.
+        UDP_FALLBACK_SECONDS = 30 #pylint: disable=invalid-name
+        udp_deadline = time.time() + UDP_FALLBACK_SECONDS
 
         while (
             self._socketstate == RinnaiConnectionState.IDLE
@@ -404,24 +438,23 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes,too-
                         if addr[0] == self._ip_address:
                             _LOGGER.debug("Broadcast received from address: %s", addr[0])
                             self._update_socket_state(RinnaiConnectionState.CONNECTING)
-                            _udp_timeout_count = 0
                 except TimeoutError:
-                    _udp_timeout_count += 1
-                    if _udp_timeout_count < MAX_UDP_FALLBACK_ATTEMPTS:
-                        _LOGGER.debug(
-                            "No broadcast received within timeout, retrying (%d/%d)",
-                            _udp_timeout_count, MAX_UDP_FALLBACK_ATTEMPTS,
-                        )
-                    else:
-                        _LOGGER.warning(
-                            "No UDP broadcast received after %d attempts, "
-                            "attempting TCP connection directly",
-                            _udp_timeout_count,
-                        )
-                        self._update_socket_state(RinnaiConnectionState.CONNECTING)
+                    _LOGGER.debug("No broadcast received within timeout, retrying")
                 except OSError as e:
                     self._update_socket_state(RinnaiConnectionState.ERROR)
                     _LOGGER.error("Unexpected broadcast error: %s", e)
+
+            if (
+                self._socketstate == RinnaiConnectionState.IDLE
+                and time.time() > udp_deadline
+            ):
+                _LOGGER.warning(
+                    "No UDP broadcast received from %s after %d seconds, "
+                    "attempting TCP connection directly",
+                    self._ip_address,
+                    UDP_FALLBACK_SECONDS,
+                )
+                self._update_socket_state(RinnaiConnectionState.CONNECTING)
 
         # If an old socket exists, try and clean it up.
         if self._socket is not None:
@@ -447,10 +480,19 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes,too-
                 # If we've made it to here, we connected successfully.
                 self._update_socket_state(RinnaiConnectionState.CONNECTED)
 
-                # Reset the timestamps and command sequence number
+                # Reset the timestamps and command sequence state
                 self._last_command_time = time.time()
                 self._last_received_time = self._last_command_time
                 self._command_sequence = 1
+                self._last_received_sequence_num = 0
+                self._command_wait = False
+                # The unit greets every new connection with *HELLO*
+                self._hello_received = False
+
+                # Drop commands queued while we were disconnected. They were issued
+                # against a stale status and replaying them now would act on the
+                # unit long after the user asked.
+                self._discard_queued_commands()
 
                 # Switch to non-blocking mode.
                 self._socket.settimeout(0)
